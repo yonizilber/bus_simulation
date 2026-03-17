@@ -91,6 +91,10 @@ if st.session_state.sim_complete:
     keep_mask = (df['state_change']) | (df['keep_random']) | (df['type'] == 'Bus')
     chart_data = df[keep_mask].copy()
 
+    # --- NEW: ALTAIR BUG FIX (Create unique segments) ---
+    # Every time the state changes, we increment a segment counter. 
+    # This stops Altair from connecting identical colors across time gaps.
+    chart_data['segment_id'] = chart_data.groupby('id')['state_change'].cumsum()
     
     # C. COLOR LOGIC (Refined)
     def get_inner_color(row):
@@ -98,20 +102,27 @@ if st.session_state.sim_complete:
 
         # BUS LOGIC
         if row['type'] == 'Bus':
-            if "SHOCKED" in state_str: 
-                return 'black'   # Panic
-            if state_str == 'IN_BAY': 
-                return '#333333'  # Dark Charcoal
+            if "SHOCKED" in state_str: return 'black'   
+            if state_str == 'IN_BAY': return '#333333'  
+            
             if state_str == 'WAITING_TO_MERGE': 
                 presence = float(row['presence'])
-                if presence <= 0.85:
-                    return '#FFD700' # Gold (Creeping)
+                
+                # DYNAMIC COLOR CALCULATION (Matches Physics)
+                lane_width = 3.5
+                safety_gap = 0.5
+                bus_width = 2.5
+                car_width = 1.9
+                
+                space_left = lane_width - (presence * bus_width)
+                space_needed = car_width + safety_gap
+                
+                if space_left >= space_needed:
+                    return '#FFD700' # Gold (Creeping, car can still pass)
                 else:
-                    return '#FF0000' # Red (Dominance)
-            
-            # If the bus is anything else (like MOVING), it is white.
-            # Make sure this is indented directly under "if row['type'] == 'Bus':"
-            return 'white'       
+                    return '#FF0000' # Red (Lane Blocked!)
+                    
+            return '#ffb3b3' # FIX: Light red instead of white for MOVING   
         
         # CAR LOGIC
         else:
@@ -128,7 +139,7 @@ if st.session_state.sim_complete:
     base = alt.Chart(chart_data).encode(
         x=alt.X('time', title='Time (s)'),
         y=alt.Y('x', title='Position (m)'),
-        detail='id',
+        detail=['id', 'segment_id'], # <--- FIX: Added segment_id here!
         tooltip=[
             alt.Tooltip('id', title='Vehicle ID'),
             alt.Tooltip('type', title='Type'),

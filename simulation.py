@@ -70,7 +70,7 @@ class SimulationEngine:
                 self._handle_bus_logic(veh)
                 
                 # Hard stop the bus physically if it is in these states
-                if veh.state in [BusState.IN_BAY, BusState.STOPPED_IN_LANE, BusState.WAITING_TO_MERGE]:
+                if veh.state in [BusState.IN_BAY, BusState.STOPPED_IN_LANE]:
                     veh.velocity = 0.0
                     veh.acceleration = 0.0
             else:
@@ -161,7 +161,22 @@ class SimulationEngine:
                     delta = 0.0
 
             # --- PHASE D: EXECUTE ---
+            old_progress = bus._merge_progress
             bus._merge_progress = min(1.0, bus._merge_progress + delta)
+            
+            # NEW: Translate sideways merging into forward motion (Phase 3)
+            # The exit taper is 15 meters.
+            progress_made = bus._merge_progress - old_progress
+            forward_movement = progress_made * 15.0
+            
+            # Physically move the bus forward
+            bus.position += forward_movement
+            
+            # Calculate the visual speed for the telemetry/charts
+            if progress_made > 0:
+                bus.velocity = forward_movement / self.dt
+            else:
+                bus.velocity = 0.0
 
             if bus._merge_progress >= 1.0:
                 bus.state = BusState.MOVING
