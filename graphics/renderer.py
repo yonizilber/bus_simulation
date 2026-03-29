@@ -17,6 +17,12 @@ class SimulationRenderer:
         self.y_center = 0.0          
         self.y_bay = -self.lane_width 
 
+        if 'width' in self.df.columns:
+            car_rows = self.df[self.df['type'] == 'Car']
+            self.reference_car_width = float(car_rows['width'].median()) if not car_rows.empty else 1.9
+        else:
+            self.reference_car_width = 1.9
+
     def draw_frame(self, ax, current_time: float, window_size=150.0):
         # Clear the old frame
         ax.clear()
@@ -68,8 +74,8 @@ class SimulationRenderer:
         presence = float(row['presence'])
         state_str = str(row['state'])
         
-        length = 11.0 if v_type == 'Bus' else 4.5
-        width = 2.5 if v_type == 'Bus' else 1.9
+        length = float(row.get('length', 11.0 if v_type == 'Bus' else 4.5))
+        width = float(row.get('width', 2.5 if v_type == 'Bus' else 1.9))
         
         # Determine Y Position
         if v_type == 'Bus':
@@ -83,7 +89,7 @@ class SimulationRenderer:
             if state_str == 'IN_BAY': color = '#333333'
             elif state_str == 'WAITING_TO_MERGE':
                 space_left = 3.5 - (presence * 2.5)
-                space_needed = 1.9 + 0.5
+                space_needed = self.reference_car_width + 0.5
                 color = '#FFD700' if space_left >= space_needed else '#FF0000'
             else:
                 color = '#e74c3c' 

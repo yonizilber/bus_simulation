@@ -1,6 +1,6 @@
 import random
 import os
-from vehicle import Vehicle, Bus, BusState, CAR_PARAMS
+from vehicle import Vehicle, Bus, BusState, CAR_PARAMS, sample_vehicle_params
 from agent import QLearningAgent
 
 def run_training(episodes=10000):
@@ -24,8 +24,9 @@ def run_training(episodes=10000):
         bus._merge_progress = 0.0
         
         start_dist = random.uniform(10.0, 70.0)
-        start_speed = random.uniform(5.0, 15.0)
-        car = Vehicle(v_id=1, position=100.0 - start_dist, velocity=start_speed, params=CAR_PARAMS)
+        _, sampled_params = sample_vehicle_params()
+        start_speed = max(4.0, sampled_params.max_speed * random.uniform(0.55, 1.00))
+        car = Vehicle(v_id=1, position=100.0 - start_dist, velocity=start_speed, params=sampled_params)
 
         total_reward = 0
         

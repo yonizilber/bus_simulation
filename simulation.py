@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 from typing import List
-from vehicle import Vehicle, Bus, BusState, CAR_PARAMS
+from vehicle import Vehicle, Bus, BusState, CAR_PARAMS, sample_vehicle_params
 from config import SimConfig
 from rl.ppo_agent import PPOAgent
 
@@ -25,6 +25,24 @@ class SimulationEngine:
         # --- LOAD THE TRAINED PYTORCH BRAIN ---
         self.brain = PPOAgent(filename="rl/checkpoints/ppo_bus_brain.pth")
         self.brain.load() # Loads the trained weights from your Hard Mode run
+
+    @staticmethod
+    def _encode_brain_state(gap, nearest_speed, nearest_accel, merge_progress, nearest_width, relative_speed):
+        gap = float(np.clip(gap, -10.0, 60.0))
+        nearest_speed = float(np.clip(nearest_speed, 0.0, 20.0))
+        nearest_accel = float(np.clip(nearest_accel, -9.0, 3.0))
+        merge_progress = float(np.clip(merge_progress, 0.0, 1.0))
+        nearest_width = float(np.clip(nearest_width, 1.70, 2.05))
+        relative_speed = float(np.clip(relative_speed, -15.0, 15.0))
+
+        gap_n = (gap + 10.0) / 70.0
+        speed_n = nearest_speed / 20.0
+        accel_n = nearest_accel / 9.0
+        progress_n = merge_progress
+        width_n = (nearest_width - 1.85) / 0.20
+        rel_speed_n = relative_speed / 15.0
+
+        return np.array([gap_n, speed_n, accel_n, progress_n, width_n, rel_speed_n], dtype=np.float32)
 
     def init_scenario(self):
         self.vehicles = []
@@ -53,7 +71,10 @@ class SimulationEngine:
             lead_vehicle = None
             if i > 0:
                 potential_lead = self.vehicles[i-1]
-                dist = potential_lead.position - veh.position - potential_lead.params.length
+                lead_length_for_dist = potential_lead.params.length
+                if isinstance(potential_lead, Bus):
+                    lead_length_for_dist = potential_lead.projected_length_along_x()
+                dist = potential_lead.position - veh.position - lead_length_for_dist
                 ignore_bus = False
                 
                 if isinstance(potential_lead, Bus):
@@ -120,6 +141,7 @@ class SimulationEngine:
                 else:
                     bus.state = BusState.WAITING_TO_MERGE
                     bus._merge_progress = 0.0 
+                    bus.merge_start_x = bus.position
                     bus.wait_time = 0.0 
 
         # 3. AI MERGE LOGIC (The PyTorch Brain)
@@ -131,18 +153,22 @@ class SimulationEngine:
             gap = 999.0
             nearest_speed = 0.0
             nearest_accel = 0.0
+            nearest_width = 1.85
             
             for v in self.vehicles:
                 if v.id != bus.id and not isinstance(v, Bus):
-                    current_gap = bus.position - bus.params.length - v.position
+                    bus_length_x = bus.projected_length_along_x()
+                    current_gap = bus.position - bus_length_x - v.position
                     if -10 < current_gap < 60:
                         if abs(current_gap) < abs(gap):
                             gap = current_gap
                             nearest_speed = v.velocity
                             nearest_accel = v.acceleration
+                            nearest_width = v.params.width
             
             # --- PHASE B: ASK THE PYTORCH BRAIN ---
-            state_array = np.array([gap, nearest_speed, nearest_accel, bus._merge_progress], dtype=np.float32)
+            relative_speed = bus.velocity - nearest_speed
+            state_array = self._encode_brain_state(gap, nearest_speed, nearest_accel, bus._merge_progress, nearest_width, relative_speed)
             state_tensor = torch.FloatTensor(state_array).unsqueeze(0)
             
             # We use no_grad and only take the mean to eliminate the "Shaking Foot" randomness
@@ -152,29 +178,34 @@ class SimulationEngine:
             
             pressure = np.clip(pressure, 0.0, 1.0)
             delta = pressure * 0.10
+            delta = min(delta, bus.max_merge_progress_step)
             
             # --- PHASE C: THE PRODUCTION SHIELD ---
+            rel_speed = bus.velocity - nearest_speed
+            adaptive_min_gap = 4.0 + max(0.0, nearest_width - 1.80) * 2.2
             if pressure > 0 and gap > -5.0:
-                if gap < 5.0 and nearest_speed > 2.0:
-                    delta = 0.0 
-                elif pressure > 0.5 and gap < 15.0 and nearest_speed > 10.0:
+                if 0.0 <= gap < 0.50:
                     delta = 0.0
+                elif bus._merge_progress > 0.65 and 0.0 <= gap < 1.20 and rel_speed > 0.2:
+                    delta = 0.0
+                elif 0.0 <= gap < adaptive_min_gap and rel_speed > 1.2:
+                    risk = np.clip((adaptive_min_gap - gap) / max(adaptive_min_gap, 1e-3), 0.0, 1.0)
+                    delta *= (1.0 - 0.85 * risk)
+                elif pressure > 0.65 and 0.0 <= gap < (adaptive_min_gap + 6.0) and rel_speed > 2.5:
+                    delta *= 0.35
+
+            if gap < 0.0 and bus._merge_progress > 0.60:
+                delta = max(delta, 0.5 * bus.max_merge_progress_step)
 
             # --- PHASE D: EXECUTE ---
-            old_progress = bus._merge_progress
+            old_x = bus.position
             bus._merge_progress = min(1.0, bus._merge_progress + delta)
-            
-            # NEW: Translate sideways merging into forward motion (Phase 3)
-            # The exit taper is 15 meters.
-            progress_made = bus._merge_progress - old_progress
-            forward_movement = progress_made * 15.0
-            
-            # Physically move the bus forward
-            bus.position += forward_movement
+            bus.position = bus.merge_start_x + (bus._merge_progress * bus.exit_taper_length)
             
             # Calculate the visual speed for the telemetry/charts
-            if progress_made > 0:
-                bus.velocity = forward_movement / self.dt
+            progress_made_x = bus.position - old_x
+            if progress_made_x > 0:
+                bus.velocity = progress_made_x / self.dt
             else:
                 bus.velocity = 0.0
 
@@ -191,8 +222,9 @@ class SimulationEngine:
 
         if random.random() < (self.traffic_rate * self.dt):
             self.global_id_counter += 1
-            start_speed = 11.0 + random.uniform(-1, 1)
-            c = Vehicle(self.global_id_counter, position=0.0, velocity=start_speed, params=CAR_PARAMS)
+            _, sampled_params = sample_vehicle_params()
+            start_speed = max(5.5, sampled_params.max_speed * random.uniform(0.68, 0.95))
+            c = Vehicle(self.global_id_counter, position=0.0, velocity=start_speed, params=sampled_params)
             self.vehicles.append(c)
             self.last_spawn_time = self.time
             self.cars_spawned_count += 1
@@ -203,11 +235,15 @@ class SimulationEngine:
         return False
 
     def _get_veh_state(self, veh):
+        length_for_gap = veh.params.length
+        if isinstance(veh, Bus):
+            length_for_gap = veh.projected_length_along_x()
+
         return {
             'id': veh.id,
             'position': veh.position,
             'velocity': veh.velocity,
-            'length': veh.params.length,
+            'length': length_for_gap,
             'presence': getattr(veh, 'presence_factor', 1.0)
         }
 
@@ -226,8 +262,11 @@ class SimulationEngine:
                 'time': self.time,
                 'id': v.id,
                 'type': "Bus" if isinstance(v, Bus) else "Car",
+                'class': "Bus" if isinstance(v, Bus) else getattr(v, 'vehicle_class', 'Mid'),
                 'x': v.position,
                 'v': v.velocity,
+                'length': v.params.length,
+                'width': v.params.width,
                 'state': state_desc,
                 'presence': final_presence,
                 'leader_info': leader_info,

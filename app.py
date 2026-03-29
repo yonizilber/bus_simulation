@@ -143,6 +143,7 @@ if st.session_state.sim_complete:
         tooltip=[
             alt.Tooltip('id', title='Vehicle ID'),
             alt.Tooltip('type', title='Type'),
+            alt.Tooltip('class', title='Class'),
             alt.Tooltip('x', format='.1f', title='Absolute Pos (m)'),
             alt.Tooltip('v', format='.1f', title='Speed (m/s)'),
             alt.Tooltip('state', title='Status'),

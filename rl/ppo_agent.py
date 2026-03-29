@@ -11,7 +11,7 @@ class ActorCritic(nn.Module):
         super(ActorCritic, self).__init__()
         
         # THE ACTOR (The Driver)
-        # 4 Inputs -> 64 Neurons -> 64 Neurons -> 1 Output (Gas Pedal)
+        # state_dim Inputs -> 64 Neurons -> 64 Neurons -> 1 Output (Gas Pedal)
         self.actor_mean = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.Tanh(), # Tanh is a math function that smooths the signal
@@ -23,10 +23,10 @@ class ActorCritic(nn.Module):
         
         # The Actor's uncertainty (How wide the Bell Curve is)
         # We start it as a learnable parameter that can shrink over time
-        self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))
+        self.actor_log_std = nn.Parameter(torch.full((1, action_dim), -0.7))
         
         # THE CRITIC (The Instructor)
-        # 4 Inputs -> 64 Neurons -> 64 Neurons -> 1 Output (Predicted Score)
+        # state_dim Inputs -> 64 Neurons -> 64 Neurons -> 1 Output (Predicted Score)
         self.critic = nn.Sequential(
             nn.Linear(state_dim, 64),
             nn.Tanh(),
@@ -39,7 +39,9 @@ class ActorCritic(nn.Module):
         # 1. Ask the Actor for the target gas pressure (mean) and uncertainty (std)
         action_mean = self.actor_mean(state)
         action_log_std = self.actor_log_std.expand_as(action_mean)
-        action_std = torch.exp(action_log_std)
+        # Clamp std to a minimum of 0.05 to prevent exploration collapse.
+        # Without this, the agent can become fully deterministic and get stuck.
+        action_std = torch.exp(action_log_std).clamp(min=0.05)
         
         # 2. Ask the Critic for the predicted score
         state_value = self.critic(state)
@@ -49,13 +51,13 @@ class ActorCritic(nn.Module):
 
 # --- 2. THE PPO MATH ENGINE ---
 class PPOAgent:
-    def __init__(self, state_dim=4, action_dim=1, filename="checkpoints/ppo_bus_brain.pth"):
+    def __init__(self, state_dim=6, action_dim=1, filename="checkpoints/ppo_bus_brain.pth"):
         self.filename = filename
         
         # Hyperparameters (The dials of the AI)
         self.gamma = 0.99       # How much it cares about the future vs immediate points
         self.clip_ratio = 0.2   # Forbid learning steps larger than 20%
-        self.lr = 3e-4          # The learning rate (how fast PyTorch tweaks the neurons)
+        self.lr = 5e-5          # Lowered from 1e-4: finer steps for fine-tuning near-optimal policy
         
         # Initialize the Brain
         self.policy = ActorCritic(state_dim, action_dim)
@@ -77,6 +79,7 @@ class PPOAgent:
         
         # Sample a point from the Bell Curve
         action = dist.sample()
+        action = torch.clamp(action, 0.0, 1.0)
         
         # Get the mathematical probability of that specific choice (needed for PPO update later)
         action_logprob = dist.log_prob(action)
@@ -101,5 +104,12 @@ class PPOAgent:
     def load(self):
         if os.path.exists(self.filename):
             # Load the neural weights back into the network
-            self.policy.load_state_dict(torch.load(self.filename))
-            print("Successfully loaded pre-trained PPO brain!")
+            try:
+                state_dict = torch.load(self.filename, weights_only=True)
+            except TypeError:
+                state_dict = torch.load(self.filename)
+            try:
+                self.policy.load_state_dict(state_dict)
+                print("Successfully loaded pre-trained PPO brain!")
+            except RuntimeError as e:
+                print(f"Checkpoint shape mismatch, starting with fresh weights: {e}")
