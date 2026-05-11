@@ -11,14 +11,14 @@ class ActorCritic(nn.Module):
         super(ActorCritic, self).__init__()
         
         # THE ACTOR (The Driver)
-        # state_dim Inputs -> 64 Neurons -> 64 Neurons -> 1 Output (Gas Pedal)
+        # state_dim Inputs -> 64 Neurons -> 64 Neurons -> 2 Outputs (steer_intent, gas_intent)
         self.actor_mean = nn.Sequential(
             nn.Linear(state_dim, 64),
-            nn.Tanh(), # Tanh is a math function that smooths the signal
+            nn.Tanh(),
             nn.Linear(64, 64),
             nn.Tanh(),
             nn.Linear(64, action_dim),
-            nn.Sigmoid() # Sigmoid forces the final output to be strictly between 0.0 and 1.0
+            nn.Tanh()  # Tanh maps to [-1, 1] for steer and gas
         )
         
         # The Actor's uncertainty (How wide the Bell Curve is)
@@ -51,7 +51,7 @@ class ActorCritic(nn.Module):
 
 # --- 2. THE PPO MATH ENGINE ---
 class PPOAgent:
-    def __init__(self, state_dim=6, action_dim=1, filename="checkpoints/ppo_bus_brain.pth"):
+    def __init__(self, state_dim=11, action_dim=2, filename="checkpoints/ppo_bus_brain.pth"):
         self.filename = filename
         
         # Hyperparameters (The dials of the AI)
@@ -79,12 +79,14 @@ class PPOAgent:
         
         # Sample a point from the Bell Curve
         action = dist.sample()
-        action = torch.clamp(action, 0.0, 1.0)
-        
+        action = torch.clamp(action, -1.0, 1.0)
+        # action[0] = steer_intent, action[1] = gas_intent (both in [-1, 1])
+
         # Get the mathematical probability of that specific choice (needed for PPO update later)
         action_logprob = dist.log_prob(action)
-        
-        return action.item(), action_logprob.item()
+
+        # Return as numpy array (shape [2]) and summed logprob scalar
+        return action.squeeze(0).numpy(), action_logprob.sum().item()
 
     def store_transition(self, state, action, action_logprob, reward, next_state, done):
         # Save this exact 0.1-second memory so we can learn from it later
