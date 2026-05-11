@@ -336,8 +336,9 @@ class SimulationEngine:
             with torch.no_grad():
                 action_mean, _, _ = self.brain.policy(state_tensor)
             # 2D action: (steer_intent, gas_intent) in [-1, 1]
+            # Defensive: if checkpoint loaded with action_dim=1, gas defaults to 0
             raw_steer = float(action_mean[0, 0].item())
-            raw_gas   = float(action_mean[0, 1].item())
+            raw_gas   = float(action_mean[0, 1].item()) if action_mean.shape[1] > 1 else 0.0
 
             # ── SAFETY SHIELD — overrides steer/gas scalars only, never kinematics ──
             steer_intent = np.clip(raw_steer, -1.0, 1.0)
