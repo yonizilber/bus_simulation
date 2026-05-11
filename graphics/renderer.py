@@ -78,10 +78,16 @@ class SimulationRenderer:
         width = float(row.get('width', 2.5 if v_type == 'Bus' else 1.9))
         
         # Determine Y Position
+        # Cars: lane centre ± actual lateral offset (nudge + O-U drift)
         if v_type == 'Bus':
             y_pos = self.y_bay + (presence * (self.y_center - self.y_bay))
         else:
-            y_pos = self.y_center + 1.5 if state_str == 'Squeezing!' else self.y_center
+            # Use logged total_lat if available, fall back to binary squeeze jump
+            total_lat = float(row.get('total_lat', float('nan')))
+            if not np.isnan(total_lat):
+                y_pos = self.y_center + total_lat
+            else:
+                y_pos = self.y_center + 1.5 if state_str == 'Squeezing!' else self.y_center
                 
         # Determine Color
         color = '#3498db' 
@@ -94,21 +100,18 @@ class SimulationRenderer:
             else:
                 color = '#e74c3c' 
 
-        # --- NEW: CALCULATE ROTATION ANGLE (SMOOTH SINE WAVE) ---
-        angle_degrees = 0.0
-        
-        if v_type == 'Bus':
-            if state_str == 'DECELERATING' and presence < 1.0:
-                # Max angle for entering (approx -10 degrees)
-                max_angle = np.degrees(np.arctan2(-self.lane_width, 20.0))
-                # Smooth ease-in, ease-out steering
-                angle_degrees = np.sin((1.0 - presence) * np.pi) * max_angle
-                
-            elif state_str == 'WAITING_TO_MERGE' and presence > 0.0:
-                # Max angle for exiting (approx +13 degrees)
-                max_angle = np.degrees(np.arctan2(self.lane_width, 15.0))
-                # Smooth ease-in, ease-out steering
-                angle_degrees = np.sin(presence * np.pi) * max_angle
+        # --- ROTATION ANGLE ---
+        # Use the physics-based heading if logged; fall back to the sine approximation.
+        angle_degrees = float(row.get('heading_deg', float('nan')))
+        if np.isnan(angle_degrees) or angle_degrees == 0.0:
+            angle_degrees = 0.0
+            if v_type == 'Bus':
+                if state_str == 'DECELERATING' and presence < 1.0:
+                    max_angle = np.degrees(np.arctan2(-self.lane_width, 20.0))
+                    angle_degrees = np.sin((1.0 - presence) * np.pi) * max_angle
+                elif state_str == 'WAITING_TO_MERGE' and presence > 0.0:
+                    max_angle = np.degrees(np.arctan2(self.lane_width, 15.0))
+                    angle_degrees = np.sin(presence * np.pi) * max_angle
 
         # --- DRAW WITH ROTATION ---
         # We use a transform to rotate the rectangle around its center

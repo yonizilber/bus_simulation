@@ -8,9 +8,9 @@ import shutil
 from env_wrapper import BusMergeEnv
 from ppo_agent import PPOAgent
 
-def evaluate_policy(agent, episodes=40, seed=123):
-    """Deterministic fixed-seed eval to separate learning trend from training noise."""
-    env = BusMergeEnv()
+def evaluate_policy(agent, episodes=40, seed=123, verbose_shield=False):
+    """Deterministic fixed-seed eval — always open-road scenario for comparable measurement."""
+    env = BusMergeEnv(eval_mode=True)  # eval_mode: always Scenario D, never curriculum
 
     successes, crashes, timeouts = 0, 0, 0
     shields = 0
@@ -19,6 +19,8 @@ def evaluate_policy(agent, episodes=40, seed=123):
     comfort_brake_steps = 0   # car decel in [-6, -4) m/s²  — yielding, natural
     emergency_brake_steps = 0 # car decel < -6 m/s²          — panic stop, undesirable
     merge_steps_sum = 0
+    # adaptive_gap diagnosis: track (progress_at_trigger, gap_at_trigger, rel_speed_at_trigger)
+    ag_snapshots = []
 
     for ep in range(episodes):
         random.seed(seed + ep)
@@ -33,7 +35,8 @@ def evaluate_policy(agent, episodes=40, seed=123):
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
             with torch.no_grad():
                 action_mean, _, _ = agent.policy(state_tensor)
-                action_value = float(action_mean.item())
+                # action_mean shape: [1, 2] — squeeze to numpy array [2]
+                action_value = action_mean.squeeze(0).numpy()
 
             next_state, _, done = env.step(action_value)
 
@@ -42,9 +45,13 @@ def evaluate_policy(agent, episodes=40, seed=123):
                 cond = env.last_shield_condition
                 if cond in shield_types:
                     shield_types[cond] += 1
+                if cond == "adaptive_gap":
+                    gap, _, _, _, rel_speed, _ = env._scan_nearest_car()
+                    progress = env._merge_progress()
+                    ag_snapshots.append((ep, progress, gap, rel_speed, float(action_value[0])))
 
-            _, _, car_accel, _, _ = env._scan_nearest_car()
-            progress = float(next_state[3])
+            _, _, car_accel, _, _, _ = env._scan_nearest_car()
+            progress = float(next_state[0])  # Feature 0 = merge_progress
             if progress > 0.1:
                 if car_accel < -6.0:
                     emergency_brake_steps += 1
@@ -64,6 +71,13 @@ def evaluate_policy(agent, episodes=40, seed=123):
             timeouts += 1
 
     ep = max(1, episodes)
+    if verbose_shield and ag_snapshots:
+        # Sample up to 10 examples to understand when adaptive_gap fires
+        sample = ag_snapshots[:10]
+        print(f"  [AG-DIAGNOSIS seed={seed}] {len(ag_snapshots)} total. "
+              f"Sample (ep, progress, gap_m, rel_spd, pressure):")
+        for s in sample:
+            print(f"    ep={s[0]:2d}  prog={s[1]:.2f}  gap={s[2]:.2f}m  rel_spd={s[3]:.2f}m/s  pressure={s[4]:.3f}")
     return {
         "successes": successes,
         "crashes": crashes,
@@ -76,8 +90,9 @@ def evaluate_policy(agent, episodes=40, seed=123):
     }
 
 
-def evaluate_policy_multi_seed(agent, episodes=40, seeds=(123, 456, 777)):
-    runs = [evaluate_policy(agent, episodes=episodes, seed=s) for s in seeds]
+def evaluate_policy_multi_seed(agent, episodes=40, seeds=(123, 456, 777), verbose_shield=False):
+    runs = [evaluate_policy(agent, episodes=episodes, seed=s, verbose_shield=(verbose_shield and i == 0))
+            for i, s in enumerate(seeds)]
     # Aggregate shield type counts across seeds
     agg_types = {}
     for key in runs[0]["shield_types"]:
@@ -133,10 +148,36 @@ def train(
     best_eval_shields = float('inf')
     best_eval_emergency_brakes = float('inf')  # Smooth-merge quality metric
     no_improve_windows = 0
+
+    # Initialize best-eval trackers from the ACTUAL quality of the loaded checkpoint.
+    # Without this, any first eval result (even worse quality) would be saved as "best"
+    # and overwrite a previously superior checkpoint.
+    print("Measuring loaded checkpoint quality before training...")
+    _init_stats = evaluate_policy_multi_seed(agent, episodes=eval_episodes, seeds=eval_seeds)
+    best_eval_crashes = _init_stats['crashes']
+    best_eval_timeouts = _init_stats['timeouts']
+    best_eval_success = _init_stats['successes']
+    best_eval_shields = _init_stats['shield_per_ep']
+    best_eval_emergency_brakes = _init_stats['emergency_brake_per_ep']
+    _tot = _init_stats['episodes_per_seed'] * _init_stats['seed_count']
+    print(f"Checkpoint baseline: Succ={best_eval_success}/{_tot} Crash={best_eval_crashes} "
+          f"TO={best_eval_timeouts} Shield/Ep={best_eval_shields:.2f}")
     
     print("Starting PPO PyTorch Training with Analytics...")
     
     for epoch in range(epochs):
+        # --- DOMAIN RANDOMIZATION CURRICULUM ---
+        # Noise sigma: start very gentle (0.05m) and grow to 0.30m by the final epoch.
+        # Too much noise at Epoch 0 makes the world chaotic and prevents convergence.
+        noise_sigma = 0.05 + (epoch / max(epochs - 1, 1)) * 0.25  # 0.05 → 0.30
+        env.noise_sigma = noise_sigma
+
+        # Shield penalty scale: 1.0 → 2.0 over training (D1 curriculum).
+        # Early: lighter penalty = agent has "training wheels", can explore freely.
+        # Late: heavier penalty = agent must find clean gaps without relying on shield.
+        shield_scale = 1.0 + (epoch / max(epochs - 1, 1))  # 1.0 → 2.0
+        env.shield_penalty_scale = shield_scale
+
         state = env.reset()
         epoch_reward = 0
         steps = 0
@@ -170,12 +211,13 @@ def train(
             if done:
                 state = env.reset()
                 
-        # --- PHASE 2: PPO UPDATE (Unchanged) ---
-        states = torch.FloatTensor(np.array([m[0] for m in agent.memory], dtype=np.float32))
-        actions = torch.FloatTensor(np.array([m[1] for m in agent.memory], dtype=np.float32)).unsqueeze(1)
-        old_logprobs = torch.FloatTensor(np.array([m[2] for m in agent.memory], dtype=np.float32)).unsqueeze(1)
+        # --- PHASE 2: PPO UPDATE ---
+        # For 2D actions, m[1] is numpy array shape (2,); m[2] is scalar logprob.
+        states       = torch.FloatTensor(np.array([m[0] for m in agent.memory], dtype=np.float32))
+        actions      = torch.FloatTensor(np.array([m[1] for m in agent.memory], dtype=np.float32))  # [batch, 2]
+        old_logprobs = torch.FloatTensor(np.array([m[2] for m in agent.memory], dtype=np.float32)).unsqueeze(1)  # [batch, 1]
         rewards = [m[3] for m in agent.memory]
-        dones = [m[5] for m in agent.memory]
+        dones   = [m[5] for m in agent.memory]
         
         discounted_rewards = []
         R = 0
@@ -193,7 +235,8 @@ def train(
         for _ in range(ppo_updates):
             action_mean, action_std, current_state_values = agent.policy(states)
             dist = torch.distributions.Normal(action_mean, action_std)
-            new_logprobs = dist.log_prob(actions)
+            # new_logprobs: [batch, 2] — sum across action dims to get per-step logprob
+            new_logprobs = dist.log_prob(actions).sum(dim=-1, keepdim=True)  # [batch, 1]
             
             ratios = torch.exp(new_logprobs - old_logprobs)
             surr1 = ratios * advantages
@@ -215,7 +258,9 @@ def train(
         # --- PHASE 3: NEW DETAILED LOGGING ---
         if (epoch + 1) % 10 == 0:
             avg_score = epoch_reward / episodes_completed if episodes_completed > 0 else 0
-            eval_stats = evaluate_policy_multi_seed(agent, episodes=eval_episodes, seeds=eval_seeds)
+            # Print adaptive_gap diagnosis on the very first eval only
+            verbose = (epoch + 1 == 10)
+            eval_stats = evaluate_policy_multi_seed(agent, episodes=eval_episodes, seeds=eval_seeds, verbose_shield=verbose)
             total_eval_episodes = eval_stats["episodes_per_seed"] * eval_stats["seed_count"]
             
             print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
@@ -281,6 +326,29 @@ def train(
 
             agent.save()
 
+    # --- FINAL VALIDATION RUN ---
+    # Uses a "secret" seed set never seen during training or eval.
+    # This is the true generalization test: if this score is significantly
+    # lower than eval, the policy has overfit to the eval seeds.
+    VALIDATION_SEEDS = (7, 31, 99, 137, 271, 314, 500, 761, 888, 1024)
+    print("\n--- Final Validation Run (secret seeds, never optimised against) ---")
+    _load_policy_weights(agent, best_path)
+    val_stats = evaluate_policy_multi_seed(agent, episodes=eval_episodes, seeds=VALIDATION_SEEDS)
+    val_total = val_stats['episodes_per_seed'] * val_stats['seed_count']
+    st = val_stats['shield_types']
+    print(
+        f"Validation | "
+        f"Succ: {val_stats['successes']}/{val_total} | "
+        f"Crash: {val_stats['crashes']} | TO: {val_stats['timeouts']} | "
+        f"Shield/Ep: {val_stats['shield_per_ep']:.2f} "
+        f"[ag={st['adaptive_gap']} hp={st['high_pressure']} lo={st['late_overlap']} "
+        f"ef={st['emergency_forward']} es={st['emergency_stop']}]"
+    )
+    if val_stats['crashes'] == 0 and val_stats['successes'] >= val_total * 0.98:
+        print("Validation PASSED: agent generalises beyond eval seeds.")
+    else:
+        print("Validation WARNING: performance gap between eval and validation seeds — possible overfitting.")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=100)
@@ -289,7 +357,7 @@ if __name__ == "__main__":
     parser.add_argument("--ppo-updates", type=int, default=2)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--rollback-patience", type=int, default=10)
-    parser.add_argument("--eval-seeds", type=str, default="123,456,777")
+    parser.add_argument("--eval-seeds", type=str, default="123,456,777,42,999,2024")
     args = parser.parse_args()
     eval_seeds = tuple(int(x.strip()) for x in args.eval_seeds.split(",") if x.strip())
     train(
