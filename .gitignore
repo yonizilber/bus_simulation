@@ -1,1 +1,7 @@
 __pycache__/
+*.pyc
+.DS_Store
+*.log
+exports/
+# Keep *.pth model files — they are small (42KB) and needed for cloud deployment
+
